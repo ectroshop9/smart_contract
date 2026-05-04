@@ -1,3 +1,4 @@
 Flask
 cryptography
 ecdsa
+psycopg2-binary
