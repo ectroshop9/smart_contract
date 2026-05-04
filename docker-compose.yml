@@ -1,0 +1,14 @@
+services:
+  vault:
+    build: .
+    container_name: al_baraka_vault
+    ports:
+      - "8080:8080"
+    environment:
+      - AES_KEY=A1B2C3D4E5F60718293A4B5C6D7E8F900112233445566778899AABBCCddeeff0
+    restart: always
+    volumes:
+      - vault_data:/app/idx_manager
+
+volumes:
+  vault_data:
