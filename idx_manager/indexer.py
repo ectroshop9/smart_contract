@@ -1,136 +1,106 @@
-import sqlite3, time, hashlib, os, json
+import os, time, hashlib, json, psycopg2
+from psycopg2.extras import RealDictCursor
 
 class Indexer:
     """
-    VAULT V4.0 — Blockchain Indexer
+    VAULT V4.0 — Blockchain Indexer for PostgreSQL (Supabase)
     - SHA-256 Chaining (previous_hash)
-    - SQLite3 WAL Mode
+    - PostgreSQL (Supabase) دائم
     - Genesis Block تلقائي
-    - استعلام عن أي كتلة
     """
     
-    def __init__(self, db_path=None):
-        if db_path:
-            self.db_path = db_path
-        else:
-            self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vault_chain.db")
+    def __init__(self):
+        self.db_url = os.getenv("DATABASE_URL")
+        if not self.db_url:
+            raise ValueError("❌ DATABASE_URL غير موجود في متغيرات البيئة")
         self._init_db()
     
+    def _get_conn(self):
+        return psycopg2.connect(self.db_url)
+    
     def _init_db(self):
-        """تهيئة قاعدة البيانات مع Genesis Block"""
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS blocks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    mac TEXT NOT NULL,
-                    previous_hash TEXT NOT NULL,
-                    block_hash TEXT NOT NULL UNIQUE,
-                    data_json TEXT NOT NULL,
-                    signature_b64 TEXT,
-                    nonce INTEGER,
-                    timestamp INTEGER NOT NULL,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS blocks (
+                        id SERIAL PRIMARY KEY,
+                        mac TEXT NOT NULL,
+                        previous_hash TEXT NOT NULL,
+                        block_hash TEXT UNIQUE NOT NULL,
+                        data_json TEXT NOT NULL,
+                        signature_b64 TEXT,
+                        nonce BIGINT,
+                        timestamp BIGINT NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                conn.commit()
             
-            # إنشاء Genesis Block إذا كانت القاعدة فارغة
-            count = conn.execute("SELECT COUNT(*) FROM blocks").fetchone()[0]
-            if count == 0:
-                genesis_hash = hashlib.sha256("GENESIS_BLOCK_AL_BARAKA_VAULT".encode()).hexdigest()
-                conn.execute("""
-                    INSERT INTO blocks (mac, previous_hash, block_hash, data_json, nonce, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    "00:00:00:00:00:00",
-                    "0000000000000000000000000000000000000000000000000000000000000000",
-                    genesis_hash,
-                    json.dumps({"type": "genesis", "system": "al_baraka_vault", "version": "4.0"}),
-                    0,
-                    int(time.time())
-                ))
+            # Genesis Block
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM blocks")
+                count = cur.fetchone()[0]
+                if count == 0:
+                    genesis_hash = hashlib.sha256("GENESIS_BLOCK_AL_BARAKA_VAULT".encode()).hexdigest()
+                    cur.execute("""
+                        INSERT INTO blocks (mac, previous_hash, block_hash, data_json, nonce, timestamp)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        "00:00:00:00:00:00",
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                        genesis_hash,
+                        json.dumps({"type": "genesis", "system": "al_baraka_vault", "version": "4.0"}),
+                        0,
+                        int(time.time())
+                    ))
+                    conn.commit()
     
-    def get_last_hash(self, mac: str) -> str:
-        """جلب آخر هاش لجهاز معين"""
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT block_hash FROM blocks WHERE mac = ? ORDER BY id DESC LIMIT 1",
-                (mac,)
-            ).fetchone()
-            return row[0] if row else "0000000000000000000000000000000000000000000000000000000000000000"
+    def get_last_hash(self, mac):
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT block_hash FROM blocks WHERE mac = %s ORDER BY id DESC LIMIT 1", (mac,))
+                row = cur.fetchone()
+                return row[0] if row else "0000000000000000000000000000000000000000000000000000000000000000"
     
-    def save_to_ledger(self, mac: str, encrypted_payload: str, decrypted_data: dict, signature_b64: str = None, nonce: int = None) -> dict:
-        """
-        تخزين كتلة جديدة في السلسلة
-        """
+    def save_to_ledger(self, mac, encrypted_payload, decrypted_data, signature_b64=None, nonce=None):
         ts = int(time.time())
         previous_hash = self.get_last_hash(mac)
-        
-        # بناء محتوى الكتلة
         data_json = json.dumps(decrypted_data)
         block_content = f"{mac}|{previous_hash}|{data_json}|{nonce}|{ts}"
         block_hash = hashlib.sha256(block_content.encode()).hexdigest()
         
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT INTO blocks (mac, previous_hash, block_hash, data_json, signature_b64, nonce, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (mac, previous_hash, block_hash, data_json, signature_b64, nonce, ts))
-            
-            block_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO blocks (mac, previous_hash, block_hash, data_json, signature_b64, nonce, timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (mac, previous_hash, block_hash, data_json, signature_b64, nonce, ts))
+                block_id = cur.fetchone()[0]
+                conn.commit()
         
-        return {
-            "block_hash": block_hash,
-            "block_id": block_id,
-            "previous_hash": previous_hash,
-            "timestamp": ts
-        }
+        return {"block_hash": block_hash, "block_id": block_id, "previous_hash": previous_hash, "timestamp": ts}
     
-    def verify_block(self, block_hash: str) -> dict:
-        """التحقق من وجود وسلامة كتلة"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM blocks WHERE block_hash = ?",
-                (block_hash,)
-            ).fetchone()
-            
-            if not row:
-                return {"status": "NOT_FOUND", "verified": False}
-            
-            return {
-                "status": "VERIFIED",
-                "verified": True,
-                "block_hash": row["block_hash"],
-                "mac": row["mac"],
-                "previous_hash": row["previous_hash"],
-                "data": json.loads(row["data_json"]),
-                "nonce": row["nonce"],
-                "timestamp": row["timestamp"]
-            }
+    def verify_block(self, block_hash):
+        with self._get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM blocks WHERE block_hash = %s", (block_hash,))
+                row = cur.fetchone()
+                if not row:
+                    return {"status": "NOT_FOUND", "verified": False}
+                return {
+                    "status": "VERIFIED", "verified": True,
+                    "block_hash": row["block_hash"], "mac": row["mac"],
+                    "previous_hash": row["previous_hash"], "data": json.loads(row["data_json"]),
+                    "nonce": row["nonce"], "timestamp": row["timestamp"]
+                }
     
-    def get_chain(self, mac: str = None, limit: int = 50) -> list:
-        """استرجاع السلسلة كاملة أو لجهاز معين"""
-        with sqlite3.connect(self.db_path) as conn:
-            if mac:
-                rows = conn.execute(
-                    "SELECT block_hash, previous_hash, mac, nonce, timestamp FROM blocks WHERE mac = ? ORDER BY id DESC LIMIT ?",
-                    (mac, limit)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT block_hash, previous_hash, mac, nonce, timestamp FROM blocks ORDER BY id DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-            
-            chain = []
-            for row in rows:
-                chain.append({
-                    "hash": row[0],
-                    "previous": row[1],
-                    "mac": row[2],
-                    "nonce": row[3],
-                    "timestamp": row[4]
-                })
-            return chain
+    def get_chain(self, mac=None, limit=50):
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                if mac:
+                    cur.execute("SELECT block_hash, previous_hash, mac, nonce, timestamp FROM blocks WHERE mac = %s ORDER BY id DESC LIMIT %s", (mac, limit))
+                else:
+                    cur.execute("SELECT block_hash, previous_hash, mac, nonce, timestamp FROM blocks ORDER BY id DESC LIMIT %s", (limit,))
+                rows = cur.fetchall()
+                return [{"hash": r[0], "previous": r[1], "mac": r[2], "nonce": r[3], "timestamp": r[4]} for r in rows]
